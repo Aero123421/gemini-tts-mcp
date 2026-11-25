@@ -1,7 +1,9 @@
 version: 2
 updates:
-  - package-ecosystem: "pip"
+  - package-ecosystem: "uv"
     directory: "/"
+    allow:
+      - dependency-type: "all"
     schedule:
       interval: "weekly"
   - package-ecosystem: "docker"

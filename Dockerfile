@@ -1,23 +1,24 @@
 FROM python:3.12-slim
 
-# Pin uv version for reproducible builds and fast cold starts (beats Claude's 10s auth timeout)
-COPY --from=ghcr.io/astral-sh/uv:0.6.14 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.11.29 /uv /usr/local/bin/uv
 
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    UV_SYSTEM_PYTHON=1 \
+    PATH="/app/.venv/bin:$PATH" \
     UV_COMPILE_BYTECODE=1 \
     PORT=8080
 
-COPY pyproject.toml README.md LICENSE ./
-COPY src ./src
+COPY pyproject.toml uv.lock README.md LICENSE ./
+RUN uv sync --frozen --no-dev --no-install-project --no-cache
 
-RUN uv pip install --no-cache . \
+COPY src ./src
+RUN uv sync --frozen --no-dev --no-editable --no-cache \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser
 
 USER appuser
+RUN test -r /app && test -x /app && python -c "import gemini_tts_mcp"
 
 EXPOSE 8080
 

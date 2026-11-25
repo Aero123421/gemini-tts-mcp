@@ -119,6 +119,8 @@ After deployment outputs your service URL (e.g. `https://gemini-tts-mcp-xxxxx-an
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
+To test with the locked dependencies, run `uv sync --frozen --python 3.12` followed by `uv run --frozen python -m unittest discover -s tests -v`.
+
 ## Disclaimer & License
 
 This is an unofficial community open-source project and is not affiliated with or endorsed by Google, OpenAI, or Anthropic.

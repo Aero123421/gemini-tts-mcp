@@ -120,6 +120,8 @@ gcloud run deploy gemini-tts-mcp \
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
+`uv.lock` の依存関係でテストするには、`uv sync --frozen --python 3.12` の後に `uv run --frozen python -m unittest discover -s tests -v` を実行します。
+
 ## 免責事項・ライセンス
 
 本リポジトリは非公式の個人オープンソースプロジェクトであり、Google・OpenAI・Anthropic とは一切関係ありません。

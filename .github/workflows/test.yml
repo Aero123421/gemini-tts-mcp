@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Lint & security check (ruff)
@@ -32,8 +32,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v6
-      - run: uv sync --python 3.12
+        with:
+          version: "0.11.29"
+      - run: uv lock --check --python 3.12
+      - run: uv sync --frozen --python 3.12
       - name: Run integration tests with installed dependencies
         run: |
-          uv run python -c "import fastmcp, google.genai, pydantic, starlette"
-          uv run python -m unittest discover -s tests -p test_integration.py -v
+          uv run --frozen python -c "import fastmcp, google.genai, pydantic, starlette"
+          uv run --frozen python -m unittest discover -s tests -p test_integration.py -v
