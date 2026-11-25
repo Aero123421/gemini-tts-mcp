@@ -667,7 +667,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
 def main() -> None:
     cfg = Settings.from_env()
     mcp = create_server(cfg)
-    mcp.run(transport="http", host="0.0.0.0", port=cfg.port)
+    mcp.run(transport="http", host="0.0.0.0", port=cfg.port)  # noqa: S104  # Required by Cloud Run
 
 
 if __name__ == "__main__":

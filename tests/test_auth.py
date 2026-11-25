@@ -43,11 +43,11 @@ class _FakeBaseProvider:
         return None
 
     async def exchange_refresh_token(
-        self, client: object, refresh_token: object, scopes: list[str]
+        self, client: object, refresh_token: types.SimpleNamespace, scopes: list[str]
     ) -> object:
         await asyncio.sleep(0.02)
         self.exchange_calls += 1
-        old_tok = getattr(refresh_token, "token")
+        old_tok = refresh_token.token
         old_key = self._hash_token(old_tok)
         self._refresh_token_store.data.pop(old_key, None)
         self._jti_mapping_store.data.pop(old_key, None)
