@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gemini-tts-mcp"
+version = "0.1.0"
+description = "KISS Gemini 3.8 TTS OAuth 2.1 Remote MCP Server for Cloud Run (ChatGPT / Claude / Gemini compatible)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=4.2.5",
+    "google-genai>=2.25.0",
+    "py-key-value-aio[firestore]>=0.4.6",
+    "google-cloud-firestore>=2.19.0",
+    "cryptography>=44.0.0",
+    "starlette>=0.41.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gemini_tts_mcp"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"
