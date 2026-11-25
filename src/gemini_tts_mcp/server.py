@@ -15,7 +15,7 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_access_token
 from pydantic import BaseModel, Field
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from .audio import (
     SceneAudio,
@@ -27,6 +27,7 @@ from .audio import (
 )
 from .auth import authorize_user_claims, build_auth_provider
 from .config import MODEL_MAP, Settings
+from .dialogue import validate_dialogue_voices
 from .guides import GUIDES, SERVER_INSTRUCTIONS
 from .jobs import JobArtifacts, JobManager, JobState
 from .rate_limit import SlidingWindowRateLimiter
@@ -90,6 +91,11 @@ def _as_json_text(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
+async def _chunks(data: bytes) -> AsyncIterator[bytes]:
+    for offset in range(0, len(data), 64 * 1024):
+        yield data[offset:offset + 64 * 1024]
+
+
 def _validate_job_id(job_id: str) -> bool:
     return bool(_JOB_ID_RE.fullmatch(job_id))
 
@@ -119,6 +125,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         max_cached_jobs=cfg.max_cached_jobs,
         max_cache_bytes=cfg.max_cache_bytes,
         ttl_sec=cfg.job_ttl_sec,
+        max_active_jobs=cfg.max_active_jobs,
     )
     zip_semaphore = asyncio.Semaphore(2)
 
@@ -128,7 +135,10 @@ def create_server(settings: Settings | None = None) -> FastMCP:
             yield
         finally:
             await job_manager.shutdown()
-            await usage_tracker.close()
+            try:
+                await usage_tracker.close()
+            finally:
+                await tts_client.close()
 
     mcp = FastMCP(
         name="Gemini TTS MCP",
@@ -170,7 +180,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
                 timeout=5.0,
             )
         except Exception:  # noqa: BLE001
-            logger.exception("Failed to record monthly usage for job %s", state.job_id)
+            logger.exception("Failed to record monthly usage for job %s", state.job_id[:8])
             state.warnings.append(
                 "Usage recording temporarily failed; audio was generated successfully."
             )
@@ -200,8 +210,8 @@ def create_server(settings: Settings | None = None) -> FastMCP:
                 job.artifacts.manifest,
                 job.artifacts.bundle_name,
             )
-        return Response(
-            content=zip_bytes,
+        return StreamingResponse(
+            content=_chunks(zip_bytes),
             media_type="application/zip",
             headers={
                 **_COMMON_SECURITY_HEADERS,
@@ -218,8 +228,8 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         job = job_manager.get(job_id)
         if not job or not job.artifacts:
             return Response("Audio expired or not found.", status_code=404, headers=_COMMON_SECURITY_HEADERS)
-        return Response(
-            content=job.artifacts.primary_wav,
+        return StreamingResponse(
+            content=_chunks(job.artifacts.primary_wav),
             media_type="audio/wav",
             headers={
                 **_COMMON_SECURITY_HEADERS,
@@ -240,8 +250,8 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         wav_bytes = job.artifacts.scene_wavs.get(f"scenes/{scene_file}")
         if not wav_bytes:
             return Response("Scene file not found.", status_code=404, headers=_COMMON_SECURITY_HEADERS)
-        return Response(
-            content=wav_bytes,
+        return StreamingResponse(
+            content=_chunks(wav_bytes),
             media_type="audio/wav",
             headers={
                 **_COMMON_SECURITY_HEADERS,
@@ -313,8 +323,9 @@ def create_server(settings: Settings | None = None) -> FastMCP:
   {scene_rows}
 </body>
 </html>"""
-        return HTMLResponse(
-            page,
+        return StreamingResponse(
+            _chunks(page.encode("utf-8")),
+            media_type="text/html",
             headers={
                 **_COMMON_SECURITY_HEADERS,
                 "Content-Security-Policy": _PLAYER_CSP,
@@ -328,7 +339,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
     async def generate_speech(
         segments: Annotated[
             list[SpeechSegment],
-            Field(description="1+ speech segments. Pass 1 item for single speech, or multiple for dialogue / video scenes."),
+            Field(min_length=1, max_length=50, description="1–50 speech segments. Pass 1 item for single speech, or multiple for dialogue / video scenes."),
         ],
         output_mode: Annotated[
             Literal["merged", "split"],
@@ -374,7 +385,8 @@ def create_server(settings: Settings | None = None) -> FastMCP:
 
         total_chars = 0
         for idx, seg in enumerate(segments, start=1):
-            tlen = len(seg.text.strip())
+            seg.text = seg.text.strip()
+            tlen = len(seg.text)
             if tlen == 0:
                 raise ValueError(f"Segment #{idx} text must not be empty.")
             if tlen > cfg.max_chars_per_segment:
@@ -392,17 +404,9 @@ def create_server(settings: Settings | None = None) -> FastMCP:
 
         # Validate speaker -> voice consistency in merged multi-speaker dialogue
         if output_mode == "merged" and len(segments) > 1:
-            speaker_voice_map: dict[str, str] = {}
-            for idx, seg in enumerate(segments, start=1):
-                spk = seg.speaker.strip() or "narrator"
-                prev_voice = speaker_voice_map.get(spk)
-                if prev_voice is not None and prev_voice != seg.voice:
-                    raise ValueError(
-                        f"Segment #{idx} assigns voice '{seg.voice}' to speaker '{spk}', "
-                        f"which already uses '{prev_voice}'. "
-                        "Give each speaker a unique `speaker` name for multi-speaker dialogue."
-                    )
-                speaker_voice_map[spk] = seg.voice
+            for seg in segments:
+                seg.speaker = seg.speaker.strip() or "narrator"
+            validate_dialogue_voices((seg.speaker, seg.voice) for seg in segments)
 
         api_calls_needed = len(segments) if output_mode == "split" else 1
         rl = rate_limiter.check_and_record(user_email, units=api_calls_needed)
@@ -417,7 +421,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
             )
 
         model = MODEL_MAP[quality]
-        title = (segments[0].text.strip().splitlines()[0] or "Gemini TTS")[:80]
+        title = (segments[0].text.splitlines()[0] or "Gemini TTS")[:80]
 
         async def _run_job(state: JobState) -> None:
             if output_mode == "merged":
@@ -437,10 +441,6 @@ def create_server(settings: Settings | None = None) -> FastMCP:
                 info = await asyncio.to_thread(inspect_wav, wav_bytes)
                 state.completed_scenes = len(segments)
 
-                job_manager.set_artifacts(
-                    state,
-                    JobArtifacts(primary_wav=wav_bytes, title=title),
-                )
                 usage_rec = await _safe_record_usage(
                     state=state,
                     model=model,
@@ -448,6 +448,10 @@ def create_server(settings: Settings | None = None) -> FastMCP:
                     duration_sec=info.duration_sec,
                     requests=1,
                     user_email=user_email,
+                )
+                job_manager.set_artifacts(
+                    state,
+                    JobArtifacts(primary_wav=wav_bytes, title=title),
                 )
                 state.result_summary = {
                     "status": "completed",
@@ -498,27 +502,24 @@ def create_server(settings: Settings | None = None) -> FastMCP:
                 asyncio.create_task(_gen_one(i, seg))
                 for i, seg in enumerate(segments, start=1)
             ]
-            usage_recorded = False
+            usage_rec = None
             try:
                 await asyncio.gather(*tasks)
             except BaseException:
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
+                for task in tasks:
+                    task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            finally:
                 if succeeded:
-                    partial_chars = sum(len(sc.text.strip()) for _, sc in succeeded)
-                    partial_sec = sum(sc.duration_sec for _, sc in succeeded)
-                    await _safe_record_usage(
+                    usage_rec = await _safe_record_usage(
                         state=state,
                         model=model,
-                        input_chars=partial_chars,
-                        duration_sec=partial_sec,
+                        input_chars=sum(len(sc.text) for _, sc in succeeded),
+                        duration_sec=sum(sc.duration_sec for _, sc in succeeded),
                         requests=len(succeeded),
                         user_email=user_email,
                     )
-                    usage_recorded = True
-                raise
 
             scene_audios = [sc for _, sc in sorted(succeeded, key=lambda x: x[0])]
             combined_wav, srt_text, manifest = await asyncio.to_thread(
@@ -539,18 +540,6 @@ def create_server(settings: Settings | None = None) -> FastMCP:
                     scene_wavs={s.filename: s.wav_bytes for s in scene_audios},
                 ),
             )
-
-            usage_rec = None
-            if not usage_recorded:
-                total_speech_sec = sum(s.duration_sec for s in scene_audios)
-                usage_rec = await _safe_record_usage(
-                    state=state,
-                    model=model,
-                    input_chars=total_chars,
-                    duration_sec=total_speech_sec,
-                    requests=len(scene_audios),
-                    user_email=user_email,
-                )
 
             state.result_summary = {
                 "status": "completed",

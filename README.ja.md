@@ -4,7 +4,7 @@
 
 ChatGPT Web / Claude.ai / Gemini（Web・Dev Mode・Enterprise）から **OAuth 2.1 ログイン**で使える、Google Cloud Run 完結の [Gemini 3.8 TTS](https://aistudio.google.com/docs/speech-generation) リモート MCP サーバーです。
 
-Google AI Pro / Ultra 特典の月額 Google Cloud クレジットを活かし、ネイティブの **Spend cap** で自動課金を防ぎながら運用できます。
+この構成では Google AI Pro / Ultra 特典の月額 Google Cloud クレジットを利用できます。
 
 ## アーキテクチャ
 
@@ -19,7 +19,7 @@ flowchart LR
 
 ## 主な特徴
 
-* **自動課金を構造的に防止**: 使う GCP サービスは `Gemini API`（AI Studio 経由）・`Cloud Run`・`Firestore`（[常時無料枠](https://docs.cloud.google.com/free/docs/free-cloud-features)）のみ。`Gemini API` と `Cloud Run` に [Google Cloud Spend cap budgets（自動停止）](https://docs.cloud.google.com/billing/docs/how-to/budgets-spend-caps) を設定し、AI Studio 側も Auto-reload OFF にすることで月 $100 クレジット枠内に収めます。
+* **Spend cap** で Gemini API と Cloud Run の利用を自動停止できます。利用額の反映と停止には遅延があり、上限を超えて課金される場合があります。ソースからのデプロイでは Cloud Build のビルド料金や Artifact Registry のイメージ保管料も別途発生し得ます。
 * **3大クライアントの OAuth 2.1 互換対応**: [FastMCP v4.2.5+](https://pypi.org/project/fastmcp/) の `GoogleProvider` を拡張し、Gemini Connected Apps の非ローテーション要件（[Google Developers](https://developers.google.com/connected-apps/mcp/oauth)）と Claude.ai / ChatGPT のローテーション＋並行リフレッシュ対策（[Claude Docs](https://claude.com/docs/connectors/building/authentication)、[FastMCP #4901](https://github.com/PrefectHQ/fastmcp/issues/4901)）を両立。Firestore 保存時の `H_`/`S_` キー衝突バグ（[google-ads-mcp #136](https://github.com/googleads/google-ads-mcp/issues/136)）および暗号化（`FernetEncryptionWrapper`）も対応済みです。
 * **60秒タイムアウト回避（ハイブリッド非同期）**: ChatGPT Web・Claude.ai の約 60 秒ハード上限（[claude-ai-mcp #115](https://github.com/anthropics/claude-ai-mcp/issues/115)）を避けるため、並列生成しつつ最大 25 秒で一旦 `job_id` を返し、`get_job(job_id)` でロングポーリングします。
 * **動画編集（NLE / Manim）即戦力パッケージ**: `output_mode="split"` で `scenes/001_*.wav`（48kHz 変換可）・`combined.wav`（無音ギャップ付き）・`subtitles.srt`（UTF-8・2行自動整形）・`manifest.json`（WAV実フレーム数から算出した厳密 `duration_sec` / タイムコード）をオンデマンド ZIP で返します。
@@ -50,6 +50,8 @@ flowchart LR
    * `cap-gemini-api`: 対象 `Gemini API` / 上限 **$80**（月 $100 枠の場合）
    * `cap-cloud-run`: 対象 `Cloud Run` / 上限 **$5**
 
+月次の推定額では、studio の入力 100 万トークンあたりの単価を 2026 年は $0.50、2027 年 1 月以降（UTC）は $1.00 としています。
+
 ### Step 3: Google OAuth クライアント ID を作成
 
 1. **API とサービス → OAuth 同意画面** でアプリ名とテストユーザー（自分の Gmail）を登録。
@@ -64,13 +66,17 @@ gcloud config set project "${PROJECT_ID}"
 gcloud iam service-accounts create gemini-tts-mcp-sa --display-name="Gemini TTS MCP"
 SA_EMAIL="gemini-tts-mcp-sa@${PROJECT_ID}.iam.gserviceaccount.com"
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA_EMAIL}" --role="roles/datastore.user"
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA_EMAIL}" --role="roles/secretmanager.secretAccessor"
 
 printf '%s' "あなたのGEMINI_API_KEY"          | gcloud secrets create gemini-api-key --data-file=-
 printf '%s' "あなたのOAUTH_CLIENT_SECRET"     | gcloud secrets create oauth-client-secret --data-file=-
 openssl rand -hex 32 | tr -d '\n'            | gcloud secrets create jwt-signing-key --data-file=-
 python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode(), end='')" \
                                              | gcloud secrets create storage-encryption-key --data-file=-
+
+for secret in gemini-api-key oauth-client-secret jwt-signing-key storage-encryption-key; do
+  gcloud secrets add-iam-policy-binding "${secret}" --project="${PROJECT_ID}" \
+    --member="serviceAccount:${SA_EMAIL}" --role="roles/secretmanager.secretAccessor"
+done
 ```
 
 ### Step 5: Cloud Run へデプロイ
@@ -104,8 +110,9 @@ gcloud run deploy gemini-tts-mcp \
 
 ## セキュリティ上の注意
 
-* **OAuth 2.1 + fail-closed 許可リスト**: 全 MCP ツールは `email_verified == true` かつ `ALLOWED_EMAILS` に含まれる Google アカウントのみ許可します。
-* **短命の Capability URL**: 再生・ダウンロード用 URL（`/play/{job_id}`・`/audio/{job_id}/...`・`/dl/{job_id}.zip`）は、ブラウザから直接再生・保存できるよう 128-bit ランダム ID による認証なし URL になっています。一時的な秘密リンクとして扱い、第三者へのチャット共有などには含めないでください（約 15 分または Cloud Run のスケールゼロで自動消滅します）。
+* 初期設定では、確認済みの Google メールアドレスが `ALLOWED_EMAILS` に含まれる場合にツールを利用できます。`ALLOW_ANY_USER=true` にすると、許可リストの設定にかかわらず、すべての確認済み Google アカウントに利用を許可します。全利用者が単一プロジェクトの API キー、カスタム声、月次使用量の集計を共有します。
+* 音声生成時は Interactions API に `store=False` を指定します。ダウンロードする ZIP の `manifest.json` には各シーンの原稿全文が含まれます。
+* **短命の Capability URL**: 再生・ダウンロード用 URL（`/play/{job_id}`・`/audio/{job_id}/...`・`/dl/{job_id}.zip`）は、ブラウザから直接再生・保存できるよう 128-bit ランダム ID による認証なし URL になっています。一時的な秘密リンクとして扱い、第三者へのチャット共有などには含めないでください（完了から約 15 分で失効し、キャッシュからの削除、Cloud Run の再デプロイ・再起動・スケールゼロでも失効します）。
 
 ## ローカルテスト
 

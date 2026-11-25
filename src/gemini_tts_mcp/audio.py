@@ -15,7 +15,7 @@ from typing import Mapping, Sequence
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 # Split sentences without breaking decimals like "3.8" or stranding closing quotes like "」"
 _SENTENCE_SPLIT_RE = re.compile(
-    r"(?<=[。！？!?])(?![」』）\)\]])\s*|(?<!\d)\.(?!\d)(?![」』）\)\]])\s*"
+    r"(?<=[。！？!?])(?![」』）\)\]])|(?<=\.)(?!\d)(?![」』）\)\]])"
 )
 
 
@@ -62,6 +62,9 @@ def inspect_wav(wav_bytes: bytes) -> WavInfo:
         sw = wf.getsampwidth()
         nframes = wf.getnframes()
         pcm = wf.readframes(nframes)
+    expected_bytes = nframes * ch * sw
+    if len(pcm) != expected_bytes:
+        raise ValueError(f"Truncated WAV: expected {expected_bytes} PCM bytes, received {len(pcm)}.")
     duration = nframes / sr if sr > 0 else 0.0
     return WavInfo(
         sample_rate=sr,
@@ -185,14 +188,16 @@ def _split_subtitle_chunks(text: str, max_chars_per_cue: int = 42) -> list[str]:
     cues: list[str] = []
     buf = ""
     for part in raw_parts:
-        part = part.strip()
         if not part:
             continue
-        if len(part) > max_chars_per_cue:
+        if not buf:
+            part = part.lstrip()
+        if len(part.lstrip()) > max_chars_per_cue:
             if buf:
                 cues.append(buf)
                 buf = ""
-            subparts = re.split(r"(?<=[、,])(?![」』）\)\]])\s*", part)
+            part = part.lstrip()
+            subparts = re.split(r"(?<=[、,])(?![」』）\)\]])", part)
             subbuf = ""
             for sp in subparts:
                 if not sp:
@@ -213,7 +218,7 @@ def _split_subtitle_chunks(text: str, max_chars_per_cue: int = 42) -> list[str]:
         else:
             if buf:
                 cues.append(buf)
-            buf = part
+            buf = part.lstrip()
     if buf:
         cues.append(buf)
     return [_wrap_two_lines(c) for c in cues]

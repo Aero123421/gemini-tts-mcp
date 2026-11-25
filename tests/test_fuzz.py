@@ -142,6 +142,13 @@ class TestFuzzInvariants(unittest.TestCase):
                 self.assertEqual(len(parsed["scenes"]), num_scenes)
                 self.assertEqual(parsed["total_duration_sec"], manifest["total_duration_sec"])
 
+    def test_fuzz_truncated_pcm_lengths(self) -> None:
+        rng = random.Random(20261125)
+        wav = _make_wav()
+        for missing in rng.sample(range(1, 500), 20):
+            with self.subTest(missing=missing), self.assertRaises(ValueError):
+                inspect_wav(wav[:-missing])
+
     def test_fuzz_firestore_key_sanitization_injective_and_valid(self) -> None:
         rng = random.Random(20261125)
         alphabet = "abcXYZ0123/_.-~@#% \t\n\x00日本語🚀"

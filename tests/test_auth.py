@@ -7,6 +7,7 @@ import gc
 import hashlib
 import types
 import unittest
+from collections import OrderedDict
 
 from gemini_tts_mcp.auth import (
     DualPolicyRefreshMixin,
@@ -32,11 +33,14 @@ class _FakeBaseProvider:
         self._refresh_token_store = _MemStore()
         self._jti_mapping_store = _MemStore()
         self.exchange_calls = 0
+        self.load_calls = 0
+        self._refresh_locks = OrderedDict()
 
     def _hash_token(self, token: str) -> str:
         return hashlib.sha256(token.encode()).hexdigest()
 
     async def load_refresh_token(self, client: object, refresh_token: str) -> object | None:
+        self.load_calls += 1
         key = self._hash_token(refresh_token)
         if await self._refresh_token_store.get(key=key) is not None:
             return types.SimpleNamespace(token=refresh_token)
@@ -49,7 +53,8 @@ class _FakeBaseProvider:
         self.exchange_calls += 1
         old_tok = refresh_token.token
         old_key = self._hash_token(old_tok)
-        self._refresh_token_store.data.pop(old_key, None)
+        if self._refresh_token_store.data.pop(old_key, None) is None:
+            raise ValueError("Token already rotated")
         self._jti_mapping_store.data.pop(old_key, None)
 
         new_tok = f"rt_rotated_{self.exchange_calls}"
@@ -148,10 +153,19 @@ class TestAuthModule(unittest.IsolatedAsyncioTestCase):
 
         # 2nd consecutive refresh with the SAME token must still succeed
         loaded2 = await provider.load_refresh_token(gemini_client, orig_rt)
-        self.assertIsNotNone(loaded2)
+        self.assertEqual(loaded2.token, "rt_rotated_1")
+        self.assertNotIn(orig_key, provider._refresh_token_store.data)
         res2 = await provider.exchange_refresh_token(gemini_client, loaded2, ["openid"])
         self.assertEqual(res2.refresh_token, orig_rt)
         self.assertEqual(provider.exchange_calls, 2)
+        loaded = await provider.load_refresh_token(gemini_client, orig_rt)
+        await asyncio.gather(
+            provider.exchange_refresh_token(gemini_client, loaded, ["openid"]),
+            provider.exchange_refresh_token(gemini_client, loaded, ["openid"]),
+        )
+        provider._refresh_token_store.data.clear()
+        self.assertIsNone(await provider.load_refresh_token(gemini_client, orig_rt))
+        self.assertFalse(provider._stable_refresh_fallback)
 
     async def test_claude_concurrent_refresh_single_flight_and_grace_load(self) -> None:
         provider = _TestDualProvider()
@@ -175,15 +189,16 @@ class TestAuthModule(unittest.IsolatedAsyncioTestCase):
 
         # Subsequent retry within 30s grace window passes load_refresh_token too
         grace_loaded = await provider.load_refresh_token(claude_client, orig_rt)
-        self.assertIsNotNone(grace_loaded)
+        self.assertIs(rt_obj, grace_loaded)
+        self.assertEqual(provider.load_calls, 1)
         r3 = await provider.exchange_refresh_token(claude_client, grace_loaded, ["openid"])
         self.assertEqual(r3.refresh_token, r1.refresh_token)
         self.assertEqual(provider.exchange_calls, 1)
 
         # Different scopes must NOT reuse the cached token response
-        r4 = await provider.exchange_refresh_token(claude_client, grace_loaded, ["openid", "email"])
+        with self.assertRaisesRegex(ValueError, "already rotated"):
+            await provider.exchange_refresh_token(claude_client, grace_loaded, ["openid", "email"])
         self.assertEqual(provider.exchange_calls, 2)
-        self.assertNotEqual(r4.refresh_token, r1.refresh_token)
 
     async def test_refresh_locks_do_not_leak_for_gemini_or_failed_refreshes(self) -> None:
         provider = _TestDualProvider()
@@ -198,7 +213,8 @@ class TestAuthModule(unittest.IsolatedAsyncioTestCase):
             await provider.exchange_refresh_token(gemini_client, loaded, ["openid"])
 
         gc.collect()
-        self.assertEqual(len(provider._refresh_locks), 0)
+        self.assertIsInstance(provider._refresh_locks, OrderedDict)
+        self.assertEqual(len(provider._dual_policy_refresh_locks), 0)
 
     def test_authorize_user_claims_fail_closed(self) -> None:
         allowed = frozenset({"alice@example.com"})
@@ -206,14 +222,16 @@ class TestAuthModule(unittest.IsolatedAsyncioTestCase):
             authorize_user_claims({"email": "Alice@Example.com", "email_verified": True}, allowed),
             "alice@example.com",
         )
-        # Missing, False, or string email_verified must be rejected (fail-closed)
+        self.assertEqual(authorize_user_claims({"email": "alice@example.com", "email_verified": "true"}, allowed),
+                         "alice@example.com")
         for bad_claims in (
             None,
             {},
             {"email": "alice@example.com"},
             {"email": "alice@example.com", "email_verified": None},
             {"email": "alice@example.com", "email_verified": False},
-            {"email": "alice@example.com", "email_verified": "true"},
+            *({"email": "alice@example.com", "email_verified": value}
+              for value in ("false", "TRUE", " true", 1, 0, [], {})),
             {"email": "bob@example.com", "email_verified": True},
         ):
             with self.assertRaises(PermissionError):

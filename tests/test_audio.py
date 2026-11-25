@@ -11,6 +11,7 @@ import zipfile
 
 from gemini_tts_mcp.audio import (
     SceneAudio,
+    _split_subtitle_chunks,
     build_video_bundle,
     format_srt_timecode,
     inspect_wav,
@@ -41,6 +42,15 @@ def _make_wav(
 
 
 class TestAudioModule(unittest.TestCase):
+    def test_english_sentence_boundaries(self) -> None:
+        text = "First sentence. Second sentence. Version 3.8 ends here."
+        cues = _split_subtitle_chunks(text)
+        self.assertEqual(" ".join(" ".join(cue.splitlines()) for cue in cues), text)
+
+    def test_truncated_pcm(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Truncated WAV"):
+            inspect_wav(_make_wav()[:-2])
+
     def test_sanitize_slug(self) -> None:
         self.assertEqual(sanitize_slug("Intro Scene 01!", "fallback"), "intro_scene_01")
         self.assertEqual(sanitize_slug("日本語のみ", "scene_001"), "scene_001")

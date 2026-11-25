@@ -4,7 +4,7 @@ English | [日本語](README.ja.md)
 
 A self-hosted **OAuth 2.1 Remote MCP Server** for [Gemini 3.8 TTS](https://aistudio.google.com/docs/speech-generation) (`gemini-3.8-flash-lite-tts` & `gemini-3.8-flash-tts`), built for **Google Cloud Run** and compatible with **ChatGPT Web**, **Claude.ai**, and **Gemini (Web / Dev Mode / Enterprise)**.
 
-Designed to run cleanly inside your monthly Google AI Pro / Ultra Google Cloud credits with native **Spend Cap** protection against unexpected billing.
+You can apply monthly Google AI Pro / Ultra Cloud credits toward this deployment.
 
 ## Architecture
 
@@ -20,7 +20,7 @@ flowchart LR
 ## Key Features
 
 * **Works across all 3 major Web MCP clients**: Extends [FastMCP v4.2.5+](https://pypi.org/project/fastmcp/) `GoogleProvider` to bridge the refresh-token spec conflict between [Gemini Connected Apps](https://developers.google.com/connected-apps/mcp/oauth) (non-rotating refresh tokens required) and [Claude.ai](https://claude.com/docs/connectors/building/authentication) / ChatGPT (rotating refresh tokens + single-flight grace cache for [FastMCP #4901](https://github.com/PrefectHQ/fastmcp/issues/4901)). Includes optional `MultiAuth` for [Gemini Enterprise](https://docs.cloud.google.com/gemini/enterprise/docs/connectors/custom-mcp-server/set-up-custom-mcp-server).
-* **No surprise bills**: Uses only `Gemini API`, `Cloud Run`, and `Firestore` ([Always Free tier](https://docs.cloud.google.com/free/docs/free-cloud-features)). Both `Gemini API` and `Cloud Run` support native [Google Cloud Spend cap budgets](https://docs.cloud.google.com/billing/docs/how-to/budgets-spend-caps) for automatic monthly pause.
+* **Spend caps** can pause Gemini API and Cloud Run usage. Billing and enforcement can lag, so charges can exceed a cap. Source deployments also use Cloud Build and Artifact Registry, which can incur separate build and image storage charges.
 * **Beats the 60-second client timeout**: Parallelizes multi-scene synthesis with a 25s sync window; longer batches return a `job_id` for long-polling via `get_job` ([claude-ai-mcp #115](https://github.com/anthropics/claude-ai-mcp/issues/115)).
 * **Video-editing ready (`output_mode="split"`)**: Generates an on-demand ZIP containing `scenes/001_*.wav` (optional 48 kHz video standard), `combined.wav` (with configurable silence gaps), UTF-8 `subtitles.srt` (auto-wrapped to 2 lines), and `manifest.json` (exact frame-measured `duration_sec` and timecodes for Premiere Pro, DaVinci Resolve, Final Cut Pro, CapCut, and Manim).
 * **Hardened for production**: Fail-closed `ALLOWED_EMAILS` allowlist + `email_verified` check, uniform `K_<sha256>` Firestore key sanitization (avoids [google-ads-mcp #136](https://github.com/googleads/google-ads-mcp/issues/136)), `FernetEncryptionWrapper`, 256 MB LRU + 15 min TTL memory cap, non-root Docker container, and two-stage per-user sliding-window rate limits (soft warn → hard block).
@@ -50,6 +50,8 @@ flowchart LR
    * `cap-gemini-api` → Service: `Gemini API`, Target: **$80**
    * `cap-cloud-run` → Service: `Cloud Run`, Target: **$5**
 
+The monthly estimate uses $0.50 per million studio input tokens in 2026 and $1.00 from January 2027 (UTC).
+
 ### 3. Create Google OAuth 2.0 Web Client
 
 1. Configure **APIs & Services → OAuth consent screen** (add your Google account as a test user).
@@ -65,7 +67,6 @@ gcloud config set project "${PROJECT_ID}"
 gcloud iam service-accounts create gemini-tts-mcp-sa --display-name="Gemini TTS MCP"
 SA_EMAIL="gemini-tts-mcp-sa@${PROJECT_ID}.iam.gserviceaccount.com"
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA_EMAIL}" --role="roles/datastore.user"
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA_EMAIL}" --role="roles/secretmanager.secretAccessor"
 
 # Store secrets in Secret Manager
 printf '%s' "YOUR_GEMINI_API_KEY"        | gcloud secrets create gemini-api-key --data-file=-
@@ -73,6 +74,11 @@ printf '%s' "YOUR_OAUTH_CLIENT_SECRET"   | gcloud secrets create oauth-client-se
 openssl rand -hex 32 | tr -d '\n'        | gcloud secrets create jwt-signing-key --data-file=-
 python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode(), end='')" \
                                          | gcloud secrets create storage-encryption-key --data-file=-
+
+for secret in gemini-api-key oauth-client-secret jwt-signing-key storage-encryption-key; do
+  gcloud secrets add-iam-policy-binding "${secret}" --project="${PROJECT_ID}" \
+    --member="serviceAccount:${SA_EMAIL}" --role="roles/secretmanager.secretAccessor"
+done
 
 # Deploy to Cloud Run (--no-cpu-throttling keeps background TTS jobs running during polling)
 gcloud run deploy gemini-tts-mcp \
@@ -103,8 +109,9 @@ After deployment outputs your service URL (e.g. `https://gemini-tts-mcp-xxxxx-an
 
 ## Security Notes
 
-* **OAuth 2.1 + fail-closed allowlist**: All MCP tools require a verified Google account (`email_verified == true`) listed in `ALLOWED_EMAILS`.
-* **Short-lived capability URLs**: Generated playback/download endpoints (`/play/{job_id}`, `/audio/{job_id}/...`, `/dl/{job_id}.zip`) are unauthenticated capability URLs backed by 128-bit random IDs so browsers can play and download audio directly. Treat them as temporary secret links (do not paste them into public shared chats; they expire automatically after ~15 minutes or on Cloud Run scale-to-zero).
+* By default, tools require a verified Google email in `ALLOWED_EMAILS`. Setting `ALLOW_ANY_USER=true` admits every verified Google account, even when an allowlist is set. All admitted users share one project’s API key, custom voices, and monthly usage totals.
+* Synthesis requests set `store=False` in the Interactions API. The ZIP’s `manifest.json` contains the full script for every scene.
+* **Short-lived capability URLs**: Generated playback/download endpoints (`/play/{job_id}`, `/audio/{job_id}/...`, `/dl/{job_id}.zip`) are unauthenticated capability URLs backed by 128-bit random IDs so browsers can play and download audio directly. Treat them as temporary secret links (do not paste them into public shared chats; they expire automatically after ~15 minutes from completion, or earlier on cache eviction, Cloud Run redeployment, restart, or scale-to-zero).
 
 ## Local Development & Tests
 

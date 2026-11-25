@@ -26,3 +26,14 @@ jobs:
         env:
           PYTHONPATH: src
         run: python -m unittest discover -s tests -v
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --python 3.12
+      - name: Run integration tests with installed dependencies
+        run: |
+          uv run python -c "import fastmcp, google.genai, pydantic, starlette"
+          uv run python -m unittest discover -s tests -p test_integration.py -v

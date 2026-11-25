@@ -3,7 +3,7 @@
 Fixes verified 2026-11 compatibility and security edge cases:
 1. Strict Gemini Connected Apps detection (all redirect_uris must be https + allowed host + /r/ or /a/).
 2. Single-flight asyncio.Lock + load_refresh_token grace cache for concurrent refresh races (FastMCP #4901).
-3. Gemini non-rotating refresh token handling supporting both hashed and raw FastMCP store keys.
+3. Gemini non-rotating refresh token handling using a stable alias for the current rotated token.
 4. Injectively hashed Firestore keys (K_<sha256>) avoiding ALL Firestore doc ID constraints
    ('.', '..', '__.*__', '/', >1500 bytes, and py-key-value-aio H_/S_ bug #136).
 5. Fernet encryption wrapper with raise_on_decryption_error=False.
@@ -65,7 +65,8 @@ def authorize_user_claims(
     email = str(claims.get("email") or "").strip().lower()
     if not email:
         raise PermissionError("Authenticated email claim is required.")
-    if claims.get("email_verified") is not True:
+    verified = claims.get("email_verified")
+    if verified is not True and not (isinstance(verified, str) and verified == "true"):
         raise PermissionError("Verified email claim is required.")
     if not allow_any_user and email not in allowed_emails:
         raise PermissionError("Access denied for this account.")
@@ -98,6 +99,8 @@ def build_firestore_client_storage(settings: Settings) -> Any:
         )
 
     from cryptography.fernet import Fernet
+    from google.api_core.exceptions import FailedPrecondition, NotFound
+    from google.cloud import firestore
     from key_value.aio.stores.firestore import (
         FirestoreStore,
         FirestoreV1CollectionSanitizationStrategy,
@@ -115,7 +118,19 @@ def build_firestore_client_storage(settings: Settings) -> Any:
         def sanitize(self, value: str) -> str:
             return sanitize_firestore_key_value(value)
 
-    store = FirestoreStore(
+    class AtomicFirestoreStore(FirestoreStore):
+        async def _delete_managed_entry(self, *, key: str, collection: str | None = None) -> bool:
+            collection, key = self._sanitize_collection_and_key(
+                collection=collection or self.default_collection, key=key
+            )
+            doc_ref = self._client.collection(collection).document(key)
+            try:
+                await doc_ref.delete(option=firestore.ExistsOption(exists=True))
+            except (NotFound, FailedPrecondition):
+                return False
+            return True
+
+    store = AtomicFirestoreStore(
         project=settings.gcp_project,
         database=settings.firestore_database,
         key_sanitization_strategy=SafeFirestoreKeySanitizationStrategy(),
@@ -137,14 +152,17 @@ class DualPolicyRefreshMixin:
 
     _grace_seconds: float = 30.0
     _max_grace_entries: int = 1000
+    _stable_collection = "gemini_stable_refresh"
 
     def _init_refresh_policy(self) -> None:
         # (client_id, sha256(old_token)) -> (expiry_monotonic, old_refresh_obj, normalized_scopes, oauth_token_response)
         self._refresh_grace_cache: OrderedDict[
             tuple[str, str], tuple[float, Any, tuple[str, ...], Any]
         ] = OrderedDict()
-        # (client_id, sha256(token)) -> asyncio.Lock (weak-referenced so unused/failed locks never leak)
-        self._refresh_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
+        self._stable_storage = getattr(self, "_client_storage", getattr(self, "client_storage", None))
+        self._stable_refresh_fallback: dict[str, str] = {}
+        # Weak references release idle per-token locks.
+        self._dual_policy_refresh_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
 
@@ -165,92 +183,81 @@ class DualPolicyRefreshMixin:
         while len(self._refresh_grace_cache) > self._max_grace_entries:
             self._refresh_grace_cache.popitem(last=False)
 
-    def _store_key_for_token(self, token_str: str) -> str:
-        """Match FastMCP's internal token hashing if present."""
-        hash_fn = getattr(self, "_hash_token", None)
-        if callable(hash_fn):
-            return str(hash_fn(token_str))
-        return token_str
-
-    async def load_refresh_token(self, client: Any, refresh_token: str) -> Any:
-        loaded = await super().load_refresh_token(client, refresh_token)  # type: ignore[misc]
-        if loaded is not None:
-            return loaded
-        now = time.monotonic()
-        self._prune_grace_cache(now)
-        ckey = self._cache_key(client, refresh_token)
-        entry = self._refresh_grace_cache.get(ckey)
-        if entry is not None and entry[0] > now:
-            return entry[1]
-        return None
-
-    async def exchange_refresh_token(
-        self,
-        client: Any,
-        refresh_token: Any,
-        scopes: list[str],
-    ) -> Any:
-        token_str = getattr(refresh_token, "token", str(refresh_token))
-        ckey = self._cache_key(client, token_str)
-        norm_scopes = self._normalize_scopes(scopes)
-        lock = self._refresh_locks.get(ckey)
+    def _policy_lock(self, key: tuple[str, str]) -> asyncio.Lock:
+        lock = self._dual_policy_refresh_locks.get(key)
         if lock is None:
             lock = asyncio.Lock()
-            self._refresh_locks[ckey] = lock
+            self._dual_policy_refresh_locks[key] = lock
+        return lock
 
-        async with lock:
-            now = time.monotonic()
-            self._prune_grace_cache(now)
+    async def _mapped_token(self, key: str) -> str | None:
+        storage = self._stable_storage
+        if storage is None:
+            return self._stable_refresh_fallback.get(key)
+        entry = await storage.get(key=key, collection=self._stable_collection)
+        return entry["token"] if entry is not None else None
 
-            entry = self._refresh_grace_cache.get(ckey)
-            if entry is not None and entry[0] > now and entry[2] == norm_scopes:
+    async def _map_token(self, key: str, token: str | None) -> None:
+        storage = self._stable_storage
+        if storage is None:
+            if token is None:
+                self._stable_refresh_fallback.pop(key, None)
+            else:
+                self._stable_refresh_fallback[key] = token
+        elif token is None:
+            await storage.delete(key=key, collection=self._stable_collection)
+        else:
+            await storage.put(key=key, value={"token": token}, collection=self._stable_collection)
+
+    async def load_refresh_token(self, client: Any, refresh_token: str) -> Any:
+        key = self._cache_key(client, refresh_token)
+        async with self._policy_lock(key):
+            if is_gemini_connected_app_client(getattr(client, "redirect_uris", None)):
+                storage_key = ":".join(key)
+                mapped = await self._mapped_token(storage_key)
+                loaded = await super().load_refresh_token(client, mapped or refresh_token)
+                if mapped and loaded is None:
+                    await self._map_token(storage_key, None)
+                elif loaded is not None:
+                    loaded._stable_refresh_token = refresh_token
+                return loaded
+            self._prune_grace_cache(time.monotonic())
+            entry = self._refresh_grace_cache.get(key)
+            if entry is not None:
+                return entry[1]
+            return await super().load_refresh_token(client, refresh_token)
+
+    async def exchange_refresh_token(self, client: Any, refresh_token: Any, scopes: list[str]) -> Any:
+        stable = getattr(refresh_token, "_stable_refresh_token", refresh_token.token)
+        key = self._cache_key(client, stable)
+        async with self._policy_lock(key):
+            if is_gemini_connected_app_client(getattr(client, "redirect_uris", None)):
+                storage_key = ":".join(key)
+                # Another exchange may have rotated the token since the handler loaded it.
+                mapped = await self._mapped_token(storage_key)
+                if mapped and mapped != refresh_token.token:
+                    refresh_token = await super().load_refresh_token(client, mapped)
+                    if refresh_token is None:
+                        await self._map_token(storage_key, None)
+                        from mcp.server.auth.provider import TokenError
+
+                        raise TokenError("invalid_grant", "Refresh token has expired")
+                response = await super().exchange_refresh_token(client, refresh_token, scopes)
+                if response.refresh_token:
+                    await self._map_token(storage_key, response.refresh_token)
+                    response.refresh_token = stable
+                return response
+
+            self._prune_grace_cache(time.monotonic())
+            entry = self._refresh_grace_cache.get(key)
+            norm_scopes = self._normalize_scopes(scopes)
+            if entry is not None and entry[2] == norm_scopes:
                 return entry[3]
-
-            redirect_uris = getattr(client, "redirect_uris", None) or []
-            is_gemini = is_gemini_connected_app_client([str(u) for u in redirect_uris])
-
-            oauth_token = await super().exchange_refresh_token(client, refresh_token, scopes)  # type: ignore[misc]
-
-            if is_gemini:
-                new_rt = getattr(oauth_token, "refresh_token", None)
-                if new_rt and new_rt != token_str:
-                    await self._restore_gemini_refresh_token(old_rt=token_str, new_rt=new_rt)
-                    oauth_token.refresh_token = token_str
-            else:
-                self._refresh_grace_cache[ckey] = (
-                    now + self._grace_seconds,
-                    refresh_token,
-                    norm_scopes,
-                    oauth_token,
-                )
-                self._refresh_grace_cache.move_to_end(ckey)
-
-            return oauth_token
-
-    async def _restore_gemini_refresh_token(self, old_rt: str, new_rt: str) -> None:
-        """Preserve the original refresh token in FastMCP's backing stores for Gemini Persistent Linking."""
-        old_key = self._store_key_for_token(old_rt)
-        new_key = self._store_key_for_token(new_rt)
-
-        rt_store = getattr(self, "_refresh_token_store", None)
-        if rt_store is not None:
-            stored = await rt_store.get(key=new_key)
-            if stored is None and new_key != new_rt:
-                stored = await rt_store.get(key=new_rt)
-                old_key = old_rt
-            if stored is not None:
-                await rt_store.put(key=old_key, value=stored)
-            else:
-                logger.warning(
-                    "FastMCP _refresh_token_store did not contain new refresh token; "
-                    "Gemini non-rotation fallback may require updating for this FastMCP version."
-                )
-
-        jti_store = getattr(self, "_jti_mapping_store", None)
-        if jti_store is not None:
-            jti_val = await jti_store.get(key=new_key)
-            if jti_val is not None:
-                await jti_store.put(key=old_key, value=jti_val)
+            response = await super().exchange_refresh_token(client, refresh_token, scopes)
+            self._refresh_grace_cache[key] = (
+                time.monotonic() + self._grace_seconds, refresh_token, norm_scopes, response
+            )
+            return response
 
 
 def build_auth_provider(settings: Settings) -> Any:

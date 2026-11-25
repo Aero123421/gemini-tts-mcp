@@ -8,6 +8,14 @@ from gemini_tts_mcp.rate_limit import SlidingWindowRateLimiter
 
 
 class TestRateLimiter(unittest.TestCase):
+    def test_prune_dormant_users(self):
+        now = [0]
+        limiter = SlidingWindowRateLimiter(clock=lambda: now[0])
+        limiter.check_and_record("dormant")
+        now[0] = 3601
+        limiter.check_and_record("active")
+        self.assertEqual(set(limiter._events), {"active"})
+
     def test_soft_warn_then_hard_block_per_minute(self) -> None:
         now = [1000.0]
         rl = SlidingWindowRateLimiter(

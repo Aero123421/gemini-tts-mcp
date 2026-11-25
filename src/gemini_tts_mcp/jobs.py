@@ -43,6 +43,7 @@ class JobState:
     status: str = "working"  # working | completed | failed
     completed_scenes: int = 0
     created_at: float = field(default_factory=time.monotonic)
+    completed_at: float | None = None
     error: str | None = None
     warnings: list[str] = field(default_factory=list)
     result_summary: dict[str, Any] | None = None
@@ -60,10 +61,12 @@ class JobManager:
         max_cache_bytes: int = 256 * 1024 * 1024,
         ttl_sec: float = 900.0,
         clock: Callable[[], float] | None = None,
+        max_active_jobs: int = 4,
     ) -> None:
+        self.max_active_jobs = max_active_jobs
         self.max_cached_jobs = max(1, max_cached_jobs)
-        self.max_cache_bytes = max(1024 * 1024, max_cache_bytes)
-        self.ttl_sec = max(60.0, ttl_sec)
+        self.max_cache_bytes = max_cache_bytes
+        self.ttl_sec = ttl_sec
         self._clock = clock or time.monotonic
         self._jobs: OrderedDict[str, JobState] = OrderedDict()
 
@@ -79,7 +82,8 @@ class JobManager:
         expired = [
             jid
             for jid, st in self._jobs.items()
-            if st.status != "working" and (now - st.created_at) > self.ttl_sec
+            if st.status != "working"
+            and now - (st.completed_at if st.completed_at is not None else st.created_at) > self.ttl_sec
         ]
         for jid in expired:
             self._jobs.pop(jid, None)
@@ -103,6 +107,8 @@ class JobManager:
 
     def set_artifacts(self, job: JobState, artifacts: JobArtifacts) -> None:
         """Attach completed artifacts and enforce byte-cap LRU eviction."""
+        if artifacts.byte_size > self.max_cache_bytes:
+            raise ValueError("Job artifacts exceed MAX_CACHE_BYTES.")
         job.artifacts = artifacts
         if job.job_id in self._jobs:
             self._jobs.move_to_end(job.job_id)
@@ -117,6 +123,8 @@ class JobManager:
         warnings: list[str],
         runner: Callable[[JobState], Coroutine[Any, Any, None]],
     ) -> JobState:
+        if sum(job.status == "working" for job in self._jobs.values()) >= self.max_active_jobs:
+            raise ValueError("MAX_ACTIVE_JOBS reached. Wait for a running job to finish.")
         job_id = secrets.token_urlsafe(16)
         state = JobState(
             job_id=job_id,
@@ -143,11 +151,12 @@ class JobManager:
                 state.status = "failed"
                 state.error = str(exc)
             except Exception as exc:  # noqa: BLE001
-                logger.exception("TTS job %s failed", job_id)
+                logger.exception("TTS job %s failed", job_id[:8])
                 state.status = "failed"
                 # Return concise safe error without leaking internal stack or credentials
                 state.error = f"Synthesis failed ({type(exc).__name__}). Check server logs for details."
             finally:
+                state.completed_at = self._clock()
                 state.done_event.set()
                 self._evict_if_needed(protect_job_id=job_id)
 

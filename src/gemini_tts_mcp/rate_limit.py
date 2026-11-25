@@ -33,11 +33,15 @@ class SlidingWindowRateLimiter:
         self.warn_per_hour = warn_per_hour
         self.block_per_hour = block_per_hour
         self._clock = clock or time.monotonic
+        self._next_cleanup = self._clock() + 60.0
         self._events: dict[str, deque[float]] = {}
 
     def check_and_record(self, user_id: str, units: int = 1) -> RateLimitResult:
         """Check limits for `user_id`. Records `units` generation events if allowed."""
         now = self._clock()
+        if now >= self._next_cleanup:
+            self._events = {user: q for user, q in self._events.items() if q and q[-1] > now - 3600}
+            self._next_cleanup = now + 60.0
         units = max(1, units)
 
         if units > self.block_per_min:

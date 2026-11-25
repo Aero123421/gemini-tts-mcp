@@ -50,6 +50,12 @@ class GeminiTTSClient:
         )
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
+    async def close(self) -> None:
+        try:
+            await self._client.aio.aclose()
+        finally:
+            self._client.close()
+
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:
         msg = str(exc).lower()
@@ -64,7 +70,7 @@ class GeminiTTSClient:
         )
 
     async def _call_with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
-        """Run blocking SDK call in a worker thread with semaphore, HTTP timeout & 429/5xx backoff."""
+        """Run async SDK call with semaphore, HTTP timeout & 429/5xx backoff."""
         max_attempts = 4
         base_delay = 1.5
         last_exc: Exception | None = None
@@ -72,7 +78,7 @@ class GeminiTTSClient:
         for attempt in range(1, max_attempts + 1):
             try:
                 async with self._semaphore:
-                    return await asyncio.to_thread(fn, *args, **kwargs)
+                    return await fn(*args, **kwargs)
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 if not self._is_retryable(exc) or attempt == max_attempts:
@@ -97,7 +103,8 @@ class GeminiTTSClient:
             ]
 
         interaction = await self._call_with_retry(
-            self._client.interactions.create,
+            self._client.aio.interactions.create,
+            store=False,
             model=model,
             input=[{"type": "user_input", "content": [content_item]}],
             response_format={"type": "audio"},
@@ -146,7 +153,8 @@ class GeminiTTSClient:
             }
 
         interaction = await self._call_with_retry(
-            self._client.interactions.create,
+            self._client.aio.interactions.create,
+            store=False,
             model=model,
             input=[{"type": "user_input", "content": content_items}],
             response_format={"type": "audio"},
@@ -172,7 +180,7 @@ class GeminiTTSClient:
         if language_code.strip():
             kwargs["language_code"] = [language_code.strip()]
 
-        resp = await self._call_with_retry(self._client.voices.list, **kwargs)
+        resp = await self._call_with_retry(self._client.aio.voices.list, **kwargs)
         results: list[dict[str, Any]] = []
         for v in getattr(resp, "voices", None) or []:
             results.append(

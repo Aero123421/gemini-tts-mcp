@@ -37,6 +37,35 @@ class TestJobsAndUsage(unittest.IsolatedAsyncioTestCase):
         second = await mgr.wait_or_progress(job, timeout_sec=1.0)
         self.assertEqual(second["status"], "completed")
 
+    async def test_active_limit_and_oversized_artifacts(self) -> None:
+        mgr = JobManager(max_active_jobs=1, max_cache_bytes=8)
+
+        async def run(job):
+            mgr.set_artifacts(job, JobArtifacts(primary_wav=b"x" * 9, title="large"))
+
+        job = mgr.create_job("user", "m", "merged", 1, [], run)
+        with self.assertRaisesRegex(ValueError, "MAX_ACTIVE_JOBS"):
+            mgr.create_job("user", "m", "merged", 1, [], run)
+        await job.task
+        self.assertIsNone(job.artifacts)
+        self.assertEqual(job.status, "failed")
+        self.assertIn("MAX_CACHE_BYTES", job.error)
+        self.assertIsNotNone(job.completed_at)
+
+    async def test_ttl_from_completion(self) -> None:
+        now = [0]
+        mgr = JobManager(ttl_sec=10, clock=lambda: now[0])
+
+        async def run(job):
+            now[0] = 50
+
+        job = mgr.create_job("user", "m", "merged", 1, [], run)
+        await job.task
+        now[0] += 9
+        self.assertIs(mgr.get(job.job_id), job)
+        now[0] += 2
+        self.assertIsNone(mgr.get(job.job_id))
+
     async def test_byte_cap_lru_eviction(self) -> None:
         # 2MB byte cap
         mgr = JobManager(max_cached_jobs=10, max_cache_bytes=2 * 1024 * 1024)
