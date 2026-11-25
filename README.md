@@ -2,7 +2,7 @@
 
 English | [日本語](README.ja.md)
 
-A KISS, self-hosted **OAuth 2.1 Remote MCP Server** for [Gemini 3.8 TTS](https://aistudio.google.com/docs/speech-generation) (`gemini-3.8-flash-lite-tts` & `gemini-3.8-flash-tts`), built for **Google Cloud Run** and compatible with **ChatGPT Web**, **Claude.ai**, and **Gemini (Web / Dev Mode / Enterprise)**.
+A self-hosted **OAuth 2.1 Remote MCP Server** for [Gemini 3.8 TTS](https://aistudio.google.com/docs/speech-generation) (`gemini-3.8-flash-lite-tts` & `gemini-3.8-flash-tts`), built for **Google Cloud Run** and compatible with **ChatGPT Web**, **Claude.ai**, and **Gemini (Web / Dev Mode / Enterprise)**.
 
 Designed to run cleanly inside your monthly Google AI Pro / Ultra Google Cloud credits with native **Spend Cap** protection against unexpected billing.
 

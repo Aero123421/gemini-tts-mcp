@@ -319,7 +319,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
             },
         )
 
-    # --- MCP Tools (5 KISS tools) ---
+    # --- MCP Tools (5 tools) ---
 
     @mcp.tool
     async def generate_speech(

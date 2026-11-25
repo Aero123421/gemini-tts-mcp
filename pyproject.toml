@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "gemini-tts-mcp"
 version = "0.1.0"
-description = "KISS Gemini 3.8 TTS OAuth 2.1 Remote MCP Server for Cloud Run (ChatGPT / Claude / Gemini compatible)"
+description = "Self-hosted Gemini 3.8 TTS OAuth 2.1 Remote MCP Server for Cloud Run (ChatGPT / Claude / Gemini compatible)"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.12"

@@ -2,7 +2,7 @@
 
 [English](README.md) | 日本語
 
-ChatGPT Web / Claude.ai / Gemini（Web・Dev Mode・Enterprise）から **OAuth 2.1 ログイン**で使える、Google Cloud Run 完結の KISS な [Gemini 3.8 TTS](https://aistudio.google.com/docs/speech-generation) リモート MCP サーバーです。
+ChatGPT Web / Claude.ai / Gemini（Web・Dev Mode・Enterprise）から **OAuth 2.1 ログイン**で使える、Google Cloud Run 完結の [Gemini 3.8 TTS](https://aistudio.google.com/docs/speech-generation) リモート MCP サーバーです。
 
 Google AI Pro / Ultra 特典の月額 Google Cloud クレジットを活かし、ネイティブの **Spend cap** で自動課金を防ぎながら運用できます。
 
