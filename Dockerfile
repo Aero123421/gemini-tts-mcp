@@ -1,4 +1,4 @@
-FROM python:3.12.7-slim
+FROM python:3.12-slim
 
 # Pin uv version for reproducible builds and fast cold starts (beats Claude's 10s auth timeout)
 COPY --from=ghcr.io/astral-sh/uv:0.6.14 /uv /usr/local/bin/uv

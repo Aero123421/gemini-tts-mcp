@@ -25,7 +25,7 @@ from .audio import (
     resample_wav_if_needed,
     sanitize_slug,
 )
-from .auth import build_auth_provider
+from .auth import authorize_user_claims, build_auth_provider
 from .config import MODEL_MAP, Settings
 from .guides import GUIDES, SERVER_INSTRUCTIONS
 from .jobs import JobArtifacts, JobManager, JobState
@@ -62,10 +62,12 @@ class SpeechSegment(BaseModel):
     )
     id: str | None = Field(
         default=None,
+        max_length=64,
         description="Optional short ASCII scene slug (e.g. 'intro', 'demo') used for split filenames.",
     )
     speaker: str = Field(
         default="narrator",
+        max_length=64,
         description=(
             "Speaker label. For multi-speaker dialogue (output_mode='merged' with 2+ segments), "
             "each speaker must have a unique label consistently mapped to one voice."
@@ -73,10 +75,12 @@ class SpeechSegment(BaseModel):
     )
     voice: str = Field(
         default="Kore",
+        max_length=128,
         description="Prebuilt voice (e.g. Kore, Puck, Charon, Zephyr, Sulafat) or custom voice_... ID.",
     )
     style: str = Field(
         default="",
+        max_length=500,
         description="Turn-level delivery instruction (e.g. 'calm and clear, moderate pace').",
     )
 
@@ -116,6 +120,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         max_cache_bytes=cfg.max_cache_bytes,
         ttl_sec=cfg.job_ttl_sec,
     )
+    zip_semaphore = asyncio.Semaphore(2)
 
     @asynccontextmanager
     async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
@@ -137,15 +142,12 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         token = get_access_token()
         if token is None:
             raise PermissionError("Authentication required.")
-        claims = getattr(token, "claims", None) or {}
-        email = (claims.get("email") or "").strip().lower()
-        if not email:
-            raise PermissionError("Authenticated email claim is required.")
-        if claims.get("email_verified") is False:
-            raise PermissionError("Verified email claim is required.")
-        if not cfg.allow_any_user and email not in cfg.allowed_emails:
-            raise PermissionError("Access denied for this account.")
-        return email
+        claims = getattr(token, "claims", None)
+        return authorize_user_claims(
+            claims=claims if isinstance(claims, dict) else None,
+            allowed_emails=cfg.allowed_emails,
+            allow_any_user=cfg.allow_any_user,
+        )
 
     async def _safe_record_usage(
         state: JobState,
@@ -189,14 +191,15 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         if not job or not job.artifacts or not job.artifacts.scene_wavs or not job.artifacts.manifest:
             return Response("ZIP expired or not found.", status_code=404, headers=_COMMON_SECURITY_HEADERS)
 
-        zip_bytes = await asyncio.to_thread(
-            build_zip_from_assets,
-            job.artifacts.scene_wavs,
-            job.artifacts.primary_wav,
-            job.artifacts.srt_text or "",
-            job.artifacts.manifest,
-            job.artifacts.bundle_name,
-        )
+        async with zip_semaphore:
+            zip_bytes = await asyncio.to_thread(
+                build_zip_from_assets,
+                job.artifacts.scene_wavs,
+                job.artifacts.primary_wav,
+                job.artifacts.srt_text or "",
+                job.artifacts.manifest,
+                job.artifacts.bundle_name,
+            )
         return Response(
             content=zip_bytes,
             media_type="application/zip",
@@ -350,7 +353,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         ] = 0.4,
         bundle_name: Annotated[
             str,
-            Field(description="Short ASCII folder name inside the ZIP (e.g. 'product_demo')."),
+            Field(max_length=64, description="Short ASCII folder name inside the ZIP (e.g. 'product_demo')."),
         ] = "narration",
     ) -> str:
         """Generate speech audio from text (single speech, multi-speaker dialogue, or video VO batch).
@@ -617,9 +620,9 @@ def create_server(settings: Settings | None = None) -> FastMCP:
 
     @mcp.tool
     async def list_voices(
-        query: Annotated[str, Field(description="Optional keyword filter (e.g. 'warm', 'narrator').")] = "",
+        query: Annotated[str, Field(max_length=100, description="Optional keyword filter (e.g. 'warm', 'narrator').")] = "",
         gender: Annotated[Literal["", "female", "male", "neutral"], Field(description="Optional gender filter.")] = "",
-        language_code: Annotated[str, Field(description="Optional BCP-47 language code (e.g. 'ja-JP', 'en-US').")] = "",
+        language_code: Annotated[str, Field(max_length=32, description="Optional BCP-47 language code (e.g. 'ja-JP', 'en-US').")] = "",
         limit: Annotated[int, Field(ge=1, le=50, description="Max voices to return.")] = 20,
     ) -> str:
         """List available Gemini TTS voices (your custom AI Studio voices appear first, followed by prebuilt voices)."""

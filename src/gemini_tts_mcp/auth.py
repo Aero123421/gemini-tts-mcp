@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import logging
 import time
+import weakref
 from collections import OrderedDict
 from typing import Any
 from urllib.parse import urlparse
@@ -51,6 +52,24 @@ def is_gemini_connected_app_client(redirect_uris: list[str] | tuple[str, ...] | 
         if not parsed.path.startswith(GEMINI_REDIRECT_PATH_PREFIXES):
             return False
     return True
+
+
+def authorize_user_claims(
+    claims: dict[str, Any] | None,
+    allowed_emails: frozenset[str],
+    allow_any_user: bool = False,
+) -> str:
+    """Fail-closed user authorization requiring a verified email claim."""
+    if not claims:
+        raise PermissionError("Authenticated email claim is required.")
+    email = str(claims.get("email") or "").strip().lower()
+    if not email:
+        raise PermissionError("Authenticated email claim is required.")
+    if claims.get("email_verified") is not True:
+        raise PermissionError("Verified email claim is required.")
+    if not allow_any_user and email not in allowed_emails:
+        raise PermissionError("Access denied for this account.")
+    return email
 
 
 def sanitize_firestore_key_value(value: str) -> str:
@@ -120,10 +139,14 @@ class DualPolicyRefreshMixin:
     _max_grace_entries: int = 1000
 
     def _init_refresh_policy(self) -> None:
-        # (client_id, sha256(old_token)) -> (expiry_monotonic, old_refresh_obj, oauth_token_response)
-        self._refresh_grace_cache: OrderedDict[tuple[str, str], tuple[float, Any, Any]] = OrderedDict()
-        # (client_id, sha256(token)) -> asyncio.Lock (single-flight per token)
-        self._refresh_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # (client_id, sha256(old_token)) -> (expiry_monotonic, old_refresh_obj, normalized_scopes, oauth_token_response)
+        self._refresh_grace_cache: OrderedDict[
+            tuple[str, str], tuple[float, Any, tuple[str, ...], Any]
+        ] = OrderedDict()
+        # (client_id, sha256(token)) -> asyncio.Lock (weak-referenced so unused/failed locks never leak)
+        self._refresh_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
 
     @staticmethod
     def _cache_key(client: Any, token_str: str) -> tuple[str, str]:
@@ -131,14 +154,16 @@ class DualPolicyRefreshMixin:
         token_hash = hashlib.sha256(token_str.encode("utf-8")).hexdigest()
         return (client_id, token_hash)
 
+    @staticmethod
+    def _normalize_scopes(scopes: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+        return tuple(sorted(str(s) for s in (scopes or ())))
+
     def _prune_grace_cache(self, now: float) -> None:
-        expired = [k for k, (exp, _, _) in self._refresh_grace_cache.items() if exp <= now]
+        expired = [k for k, (exp, _, _, _) in self._refresh_grace_cache.items() if exp <= now]
         for k in expired:
             self._refresh_grace_cache.pop(k, None)
-            self._refresh_locks.pop(k, None)
         while len(self._refresh_grace_cache) > self._max_grace_entries:
-            old_k, _ = self._refresh_grace_cache.popitem(last=False)
-            self._refresh_locks.pop(old_k, None)
+            self._refresh_grace_cache.popitem(last=False)
 
     def _store_key_for_token(self, token_str: str) -> str:
         """Match FastMCP's internal token hashing if present."""
@@ -167,15 +192,19 @@ class DualPolicyRefreshMixin:
     ) -> Any:
         token_str = getattr(refresh_token, "token", str(refresh_token))
         ckey = self._cache_key(client, token_str)
-        lock = self._refresh_locks.setdefault(ckey, asyncio.Lock())
+        norm_scopes = self._normalize_scopes(scopes)
+        lock = self._refresh_locks.get(ckey)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._refresh_locks[ckey] = lock
 
         async with lock:
             now = time.monotonic()
             self._prune_grace_cache(now)
 
             entry = self._refresh_grace_cache.get(ckey)
-            if entry is not None and entry[0] > now:
-                return entry[2]
+            if entry is not None and entry[0] > now and entry[2] == norm_scopes:
+                return entry[3]
 
             redirect_uris = getattr(client, "redirect_uris", None) or []
             is_gemini = is_gemini_connected_app_client([str(u) for u in redirect_uris])
@@ -191,6 +220,7 @@ class DualPolicyRefreshMixin:
                 self._refresh_grace_cache[ckey] = (
                     now + self._grace_seconds,
                     refresh_token,
+                    norm_scopes,
                     oauth_token,
                 )
                 self._refresh_grace_cache.move_to_end(ckey)

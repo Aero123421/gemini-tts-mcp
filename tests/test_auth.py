@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import types
 import unittest
 
 from gemini_tts_mcp.auth import (
     DualPolicyRefreshMixin,
+    authorize_user_claims,
     is_gemini_connected_app_client,
     sanitize_firestore_key_value,
 )
@@ -177,6 +179,61 @@ class TestAuthModule(unittest.IsolatedAsyncioTestCase):
         r3 = await provider.exchange_refresh_token(claude_client, grace_loaded, ["openid"])
         self.assertEqual(r3.refresh_token, r1.refresh_token)
         self.assertEqual(provider.exchange_calls, 1)
+
+        # Different scopes must NOT reuse the cached token response
+        r4 = await provider.exchange_refresh_token(claude_client, grace_loaded, ["openid", "email"])
+        self.assertEqual(provider.exchange_calls, 2)
+        self.assertNotEqual(r4.refresh_token, r1.refresh_token)
+
+    async def test_refresh_locks_do_not_leak_for_gemini_or_failed_refreshes(self) -> None:
+        provider = _TestDualProvider()
+        gemini_client = types.SimpleNamespace(
+            client_id="gemini-dcr-leak",
+            redirect_uris=["https://oauth-redirect.googleusercontent.com/r/app1"],
+        )
+        for i in range(10):
+            rt = f"rt_gemini_{i}"
+            await provider._refresh_token_store.put(provider._hash_token(rt), "payload")
+            loaded = await provider.load_refresh_token(gemini_client, rt)
+            await provider.exchange_refresh_token(gemini_client, loaded, ["openid"])
+
+        gc.collect()
+        self.assertEqual(len(provider._refresh_locks), 0)
+
+    def test_authorize_user_claims_fail_closed(self) -> None:
+        allowed = frozenset({"alice@example.com"})
+        self.assertEqual(
+            authorize_user_claims({"email": "Alice@Example.com", "email_verified": True}, allowed),
+            "alice@example.com",
+        )
+        # Missing, False, or string email_verified must be rejected (fail-closed)
+        for bad_claims in (
+            None,
+            {},
+            {"email": "alice@example.com"},
+            {"email": "alice@example.com", "email_verified": None},
+            {"email": "alice@example.com", "email_verified": False},
+            {"email": "alice@example.com", "email_verified": "true"},
+            {"email": "bob@example.com", "email_verified": True},
+        ):
+            with self.assertRaises(PermissionError):
+                authorize_user_claims(bad_claims, allowed)
+
+        # allow_any_user still requires verified email
+        self.assertEqual(
+            authorize_user_claims(
+                {"email": "bob@example.com", "email_verified": True},
+                allowed,
+                allow_any_user=True,
+            ),
+            "bob@example.com",
+        )
+        with self.assertRaises(PermissionError):
+            authorize_user_claims(
+                {"email": "bob@example.com"},
+                allowed,
+                allow_any_user=True,
+            )
 
 
 if __name__ == "__main__":

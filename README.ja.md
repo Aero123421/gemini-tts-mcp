@@ -102,6 +102,11 @@ gcloud run deploy gemini-tts-mcp \
    * **承認済みのリダイレクト URI**: `https://gemini-tts-mcp-xxxxx-an.a.run.app/auth/callback`
 3. ChatGPT Web / Claude.ai / Gemini のカスタム MCP 設定に `https://gemini-tts-mcp-xxxxx-an.a.run.app/mcp` を登録してログインします。
 
+## セキュリティ上の注意
+
+* **OAuth 2.1 + fail-closed 許可リスト**: 全 MCP ツールは `email_verified == true` かつ `ALLOWED_EMAILS` に含まれる Google アカウントのみ許可します。
+* **短命の Capability URL**: 再生・ダウンロード用 URL（`/play/{job_id}`・`/audio/{job_id}/...`・`/dl/{job_id}.zip`）は、ブラウザから直接再生・保存できるよう 128-bit ランダム ID による認証なし URL になっています。一時的な秘密リンクとして扱い、第三者へのチャット共有などには含めないでください（約 15 分または Cloud Run のスケールゼロで自動消滅します）。
+
 ## ローカルテスト
 
 ```bash

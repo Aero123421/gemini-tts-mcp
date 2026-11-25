@@ -101,6 +101,11 @@ After deployment outputs your service URL (e.g. `https://gemini-tts-mcp-xxxxx-an
    * **Authorized redirect URIs**: `https://gemini-tts-mcp-xxxxx-an.a.run.app/auth/callback`
 3. Register `https://gemini-tts-mcp-xxxxx-an.a.run.app/mcp` in ChatGPT Web, Claude.ai, or Gemini and sign in.
 
+## Security Notes
+
+* **OAuth 2.1 + fail-closed allowlist**: All MCP tools require a verified Google account (`email_verified == true`) listed in `ALLOWED_EMAILS`.
+* **Short-lived capability URLs**: Generated playback/download endpoints (`/play/{job_id}`, `/audio/{job_id}/...`, `/dl/{job_id}.zip`) are unauthenticated capability URLs backed by 128-bit random IDs so browsers can play and download audio directly. Treat them as temporary secret links (do not paste them into public shared chats; they expire automatically after ~15 minutes or on Cloud Run scale-to-zero).
+
 ## Local Development & Tests
 
 ```bash
